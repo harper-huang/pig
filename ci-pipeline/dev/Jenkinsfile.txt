@@ -1,0 +1,220 @@
+pipeline {
+    agent {
+        label 'maven'
+    }
+
+    parameters {
+        choice(choices: ['dev', 'test', 'pre', 'pre2','prod'], name: 'Environments', description: '请选择要发布的环境：dev开发环境、test测试环境、pre预发布环境、pre2灰度环境、prod 生产环境')
+        choice(choices: ['pig-gateway', 'pig-auth', 'pig-register', 'pig-upms-biz','pig-codegen', 'pig-monitor', 'pig-sentinel-dashboard', 'pig-xxl-job-admin','all'], name: 'ServicesDeploy', description: '请选择要构建的服务,支持单个服务发布或全部服务发布')
+        choice(choices: ['no', 'yes'], name: 'sonarQube', description: '是否进行sonarQube代码质量检查,默认为no')
+        string(name: 'MultiServicesBuild', defaultValue: 'no', description: '自由组合发布服务,如填写pig-gateway,pig-auth等,默认此项不生效,和ServicesDeploy只能选其一')
+    }
+
+    environment {
+        HARBOR_CREDENTIAL_ID = 'harbor-id'
+        GITLAB_CREDENTIAL_ID = 'gitlab'
+        KUBECONFIG_CREDENTIAL_ID = 'pig-kubeconfig'
+        REGISTRY = 'ip:端口'//harbor镜像仓库
+        HARBOR_NAMESPACE = 'pig-dev'
+        K8S_NAMESPACE = 'pig-dev'
+    }
+
+    stages {
+
+        stage ('拉取代码') {
+            steps {
+                checkout(scm)
+            }
+        }
+
+  stage('初始化变量') {
+    agent none
+    steps {
+   container('maven') {
+     script {
+    //自由组合发布
+    if("${params.MultiServicesBuild}".trim() != "no") {
+      ServicesBuild = "${params.MultiServicesBuild}".split(",")
+      for (service in ServicesBuild) {
+     println "now got ${service}"
+      }
+    }else if("${params.ServicesDeploy}".trim() == "all"){
+     ServicesBuildStr = 'pig-gateway,pig-auth,pig-register,pig-upms-biz,pig-codegen,pig-monitor,pig-sentinel-dashboard,pig-xxl-job-admin'
+     ServicesBuild = "${ServicesBuildStr}".split(",")
+    }else if("${params.ServicesDeploy}".trim() != "all"){
+     ServicesBuild = "${params.ServicesDeploy}".split(",")
+    }
+     }
+   }
+    }
+     }
+        stage('sonarQube代码质量检查') {
+            steps {
+                script {
+                    if("${params.sonarQube}".trim() == "yes") {
+                       for (service in ServicesBuild) {
+                          def workspace = "pig-"
+                          println "当前进行代码质量检查是：${service}"
+                          if("${service}".trim() == "pig-gateway" || "${service}".trim() == "pig-auth" || "${service}".trim() == "pig-register"){
+                              workspace = "${workspace}" + "${service}".trim().split("-")[1]
+                           }
+                          if("${service}".trim() == "pig-codegen" || "${service}".trim() == "pig-monitor" || "${service}".trim() == "pig-sentinel-dashboard" || "${service}".trim() == "pig-xxl-job-admin"){
+                              workspace = "pig-visual/" + "${service}".trim()
+                          }
+                           if("${service}".trim() == "pig-upms-biz"){
+                               workspace = "pig-upms/" + "${service}".trim()
+                           }
+                           //定义当前Jenkins的SonarQubeScanner工具
+                           scannerHome = tool 'sonar-scanner'
+                           //引用当前JenkinsSonarQube环境
+                           withSonarQubeEnv('sonarqube9.4') {
+                               sh """
+                               cd ${workspace}
+                               ${scannerHome}/bin/sonar-scanner
+                           """
+                           }
+                       }
+                    }else{
+                        println "是no，跳过sonarQube代码质量检查"
+                    }
+                }
+            }
+        }
+
+  stage('打包') {
+   agent none
+   steps {
+    container('maven') {
+      script {
+                    sh "mvn -Dmaven.test.skip=true clean package -P${params.Environments}"
+      }
+    }
+   }
+  }
+
+  stage('构建镜像') {
+   agent none
+   steps {
+    container('maven') {
+      script {
+                    for (service in ServicesBuild) {
+                      def workspace = "pig-"
+                      println "当前构建的镜像是：${service}"
+                      stage ("build ${service}") {
+                          if("${service}".trim() == "pig-gateway" || "${service}".trim() == "pig-auth" || "${service}".trim() == "pig-register"){
+                              workspace = "${workspace}" + "${service}".trim().split("-")[1]
+                           }
+                          if("${service}".trim() == "pig-codegen" || "${service}".trim() == "pig-monitor" || "${service}".trim() == "pig-sentinel-dashboard" || "${service}".trim() == "pig-xxl-job-admin"){
+                              workspace = "pig-visual/" + "${service}".trim()
+                          }
+                           if("${service}".trim() == "pig-upms-biz"){
+                               workspace = "pig-upms/" + "${service}".trim()
+                           }
+                        sh "cd ${workspace} && docker build -f Dockerfile -t $REGISTRY/$HARBOR_NAMESPACE/${service}:$BUILD_NUMBER ."
+                      }
+                    }
+      }
+    }
+   }
+  }
+
+  stage('镜像推送') {
+   agent none
+   steps {
+    container('maven') {
+      script {
+     for (service in ServicesBuild) {
+       println "当前推送的镜像是：${service}"
+       stage ("push ${service}") {
+      withCredentials([usernamePassword(passwordVariable : 'HARBOR_PASSWORD' ,usernameVariable : 'HARBOR_USERNAME' ,credentialsId : "$HARBOR_CREDENTIAL_ID" ,)]) {
+       sh 'echo "$HARBOR_PASSWORD" | docker login $REGISTRY -u "$HARBOR_USERNAME" --password-stdin'
+       sh "docker push  $REGISTRY/$HARBOR_NAMESPACE/${service}:$BUILD_NUMBER"
+      }
+       }
+     }
+      }
+    }
+   }
+  }
+
+  stage('推送镜像之latest') {
+   agent none
+   steps {
+    container('maven') {
+      script {
+     for (service in ServicesBuild) {
+       println "当前推送的latest镜像是：${service}"
+       stage ("pushLatest ${service}") {
+      sh "docker tag  $REGISTRY/$HARBOR_NAMESPACE/${service}:$BUILD_NUMBER $REGISTRY/$HARBOR_NAMESPACE/${service}:latest"
+      sh "docker push  $REGISTRY/$HARBOR_NAMESPACE/${service}:latest"
+       }
+     }
+      }
+    }
+   }
+  }
+
+  stage('部署到dev环境') {
+    steps {
+     container ('maven') {
+       script {
+      for (service in ServicesBuild) {
+                       //自定义的全局变量,也就是整个流水线可以去使用
+                       env.APP_NAME = "${service}"
+                       if("${service}".trim() == "pig-gateway") {
+                          env.NODEPORT = 31201
+                          env.PORT = 9999
+                        }
+                       if("${service}".trim() == "pig-auth") {
+                          env.NODEPORT = 31202
+                          env.PORT = 3000
+                        }
+                       if("${service}".trim() == "pig-register") {
+                          env.NODEPORT = 31203
+                          env.PORT = 8848
+                        }
+                       if("${service}".trim() == "pig-upms-biz") {
+                          env.NODEPORT = 31204
+                          env.PORT = 4000
+                        }
+                       if("${service}".trim() == "pig-codegen") {
+                          env.NODEPORT = 31205
+                          env.PORT = 5002
+                        }
+                       if("${service}".trim() == "pig-monitor") {
+                          env.NODEPORT = 31206
+                          env.PORT = 5001
+                        }
+                       if("${service}".trim() == "pig-sentinel-dashboard") {
+                          env.NODEPORT = 31207
+                          env.PORT = 5003
+                        }
+                       if("${service}".trim() == "pig-xxl-job-admin") {
+                          env.NODEPORT = 31208
+                          env.PORT = 5004
+                        }
+
+        stage ("deploy ${service}") {
+      println "即将部署的服务是 $APP_NAME"
+         withCredentials([
+          kubeconfigFile(
+          credentialsId: env.KUBECONFIG_CREDENTIAL_ID,
+          variable: 'KUBECONFIG')
+          ]) {
+                                   if("${service}".trim() == "pig-register") {
+                                       sh "envsubst < deploy/${params.Environments}/nacos-devops.yaml | kubectl apply -f -"
+                                   }else{
+                                       sh "envsubst < deploy/${params.Environments}/devops.yaml | kubectl apply -f -"
+                                   }
+         }
+        }
+      }
+       }
+     }
+    }
+  }
+
+
+ }
+
+}
